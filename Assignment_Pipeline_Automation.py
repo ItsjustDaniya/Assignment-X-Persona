@@ -5,7 +5,9 @@ Auto-generated cron pipeline — WOW assignment tracking
 
 Ported from the DS_batches_data notebook, wrapped for unattended GitHub
 Actions execution:
-  - Auth via env vars / service account instead of Colab's interactive auth.
+  - Auth via a Metabase API key (X-Api-Key header) instead of the old
+    username/password session-login flow — no more ASHRITHA_SECRET_KEY,
+    no login POST, no token refresh step.
   - requests.post is patched to use a retry-hardened Session (connection
     resets / 5xx / 429 are retried automatically), matching the fix applied
     to the main Assignment Automation Pipeline for card 9913-style failures.
@@ -29,16 +31,12 @@ from google.oauth2.service_account import Credentials
 start_time = time.time()
 
 # -------------------- ENV & AUTH --------------------
-sec = os.getenv("ASHRITHA_SECRET_KEY")
-User_name = os.getenv("METABASE_USERNAME") or os.getenv("USERNAME")
+METABASE_API_KEY = os.getenv("METABASE_API_KEY")
 service_account_json = os.getenv("SERVICE_ACCOUNT_JSON")
-MB_URL = os.getenv("METABASE_URL")
 
 missing = [n for n, v in [
-    ("ASHRITHA_SECRET_KEY", sec),
-    ("METABASE_USERNAME/USERNAME", User_name),
+    ("METABASE_API_KEY", METABASE_API_KEY),
     ("SERVICE_ACCOUNT_JSON", service_account_json),
-    ("METABASE_URL", MB_URL),
 ] if not v]
 if missing:
     raise ValueError(f"❌ Missing environment variables: {', '.join(missing)}")
@@ -82,28 +80,16 @@ SESSION.mount("http://", _adapter)
 # call site individually.
 requests.post = SESSION.post
 
-token = None
-
-
-def refresh_metabase_token():
-    global token
-    res = SESSION.post(
-        MB_URL,
-        headers={"Content-Type": "application/json"},
-        json={"username": User_name, "password": sec},
-        timeout=(15, 60),
-    )
-    res.raise_for_status()
-    token = res.json()["id"]
-    print("✅ Metabase session token refreshed")
-
-
-refresh_metabase_token()
+# Static header used for every Metabase API call — no login step, no
+# token expiry/refresh to worry about.
+METABASE_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Api-Key": METABASE_API_KEY,
+}
 
 print("🔎 ENV CHECK")
-print(f"   MB user           : {'[SET]' if User_name else '[MISSING]'}")
-print(f"   SA client_email   : {service_info.get('client_email')}")
-print(f"   Token acquired    : {bool(token)}")
+print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
+print(f"   SA client_email    : {service_info.get('client_email')}")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # PIPELINE BODY (ported from notebook cells: 13,14,15)
@@ -139,8 +125,8 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     def fetch_card(card_id):
         r = requests.post(
-            f'https://metabase-lierhfgoeiwhr.newtonschool.co/api/card/{card_id}/query/json',
-            headers={'Content-Type': 'application/json', 'X-Metabase-Session': token},
+            f'{METABASE_BASE}/api/card/{card_id}/query/json',
+            headers=METABASE_HEADERS,
             timeout=3600
         )
         r.raise_for_status()
