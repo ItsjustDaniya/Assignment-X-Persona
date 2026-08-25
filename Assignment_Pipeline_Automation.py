@@ -185,7 +185,7 @@ try:
     # STEP 5: Write to Google Sheets
     # ═══════════════════════════════════════════════════════════════════════════
     print("Uploading...")
-    sheet = gc.open_by_key('1knzRvmPqhvSudEJeXksQeXSZklAybIBfd_IMH7XLMK4')
+    sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
     ws = sheet.worksheet("Student-Assign-WOW")
     ws.clear()
     set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
@@ -199,7 +199,7 @@ try:
     # ──────────────────────────────────────────────────────────────────────
     # Cell 14 — manual re-write to same sheet, kept as-is
     # ──────────────────────────────────────────────────────────────────────
-    sheet = gc.open_by_key('1knzRvmPqhvSudEJeXksQeXSZklAybIBfd_IMH7XLMK4')
+    sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
     ws = sheet.worksheet("Student-Assign-WOW")
     ws.clear()
     set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
