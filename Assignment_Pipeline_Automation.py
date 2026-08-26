@@ -28,6 +28,13 @@ from urllib3.util.retry import Retry
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 
+# Force line-buffered stdout so print() output interleaves in the same
+# chronological order as stderr tracebacks in GitHub Actions logs. Without
+# this, stdout is block-buffered when not attached to a terminal, which is
+# why the ENV CHECK / "Fetching both cards..." prints appeared to run
+# *after* the traceback in the log even though they clearly ran first.
+sys.stdout.reconfigure(line_buffering=True)
+
 start_time = time.time()
 
 # -------------------- ENV & AUTH --------------------
@@ -123,16 +130,68 @@ try:
     # ═══════════════════════════════════════════════════════════════════════════
     # STEP 2: Fetch BOTH Metabase cards and union them
     # ═══════════════════════════════════════════════════════════════════════════
-    def fetch_card(card_id):
-        r = requests.post(
-            f'{METABASE_BASE}/api/card/{card_id}/query/json',
-            headers=METABASE_HEADERS,
-            timeout=3600
+    def fetch_card(card_id, max_retries=4, retry_backoff=15):
+        """Fetch a card's data, with retries for two failure modes that have
+        both been seen on card 11345 across different runs: a clean HTTP
+        error (400/5xx), and a 200 status with an empty/non-JSON body (the
+        query ran but the response got truncated somewhere upstream). Both
+        point to an intermittently overloaded/flaky backend rather than a
+        fixed bug in the request itself, so retrying with backoff is
+        actually worth doing here."""
+        url = f'{METABASE_BASE}/api/card/{card_id}/query/json'
+        last_error = None
+
+        for attempt in range(1, max_retries + 1):
+            print(f"  → Fetching card {card_id}" +
+                  (f" (attempt {attempt}/{max_retries})" if attempt > 1 else "") + "...")
+            attempt_start = time.time()
+            r = requests.post(url, headers=METABASE_HEADERS, timeout=3600)
+            elapsed = time.time() - attempt_start
+
+            if not r.ok:
+                # r.raise_for_status() throws away Metabase's actual error body,
+                # which almost always explains *why* (e.g. a missing required
+                # template parameter, or the question itself was edited into a
+                # broken state) instead of just the generic status code.
+                try:
+                    detail = r.json()
+                except ValueError:
+                    detail = r.text
+                last_error = (
+                    f"HTTP {r.status_code} after {elapsed:.1f}s (URL: {r.url})\n"
+                    f"Response body: {detail}"
+                )
+            else:
+                try:
+                    payload = r.json()
+                except ValueError:
+                    last_error = (
+                        f"HTTP {r.status_code} after {elapsed:.1f}s but body was not "
+                        f"valid JSON (body length {len(r.text)}, URL: {r.url})\n"
+                        f"Response body (first 300 chars): {r.text[:300]!r}"
+                    )
+                else:
+                    d = pd.DataFrame(payload)
+                    print(f"  ✓ Card {card_id}: {len(d)} rows, {len(d.columns)} cols "
+                          f"(took {elapsed:.1f}s)")
+                    return d
+
+            if attempt < max_retries:
+                print(f"  ⚠️  Card {card_id} attempt {attempt} failed: {last_error}\n"
+                      f"     Retrying in {retry_backoff}s...")
+                time.sleep(retry_backoff)
+                retry_backoff = min(retry_backoff * 2, 120)
+
+        raise RuntimeError(
+            f"❌ Card {card_id} failed after {max_retries} attempts. Last error:\n"
+            f"{last_error}\n"
+            "If this keeps happening: open the question directly in Metabase "
+            "(not inside a dashboard) and confirm it runs cleanly there. A "
+            "clean 400 usually means a required template parameter with no "
+            "default value; a 200-with-empty-body usually means the query is "
+            "slow/heavy enough that something upstream is truncating the "
+            "response — consider adding a result cache to it in Metabase."
         )
-        r.raise_for_status()
-        d = pd.DataFrame(r.json())
-        print(f"  ✓ Card {card_id}: {len(d)} rows, {len(d.columns)} cols")
-        return d
 
     print("Fetching both cards...")
     df1 = fetch_card(11345)          # Assignments WOW
@@ -195,23 +254,6 @@ try:
     print(f"Rows: {len(df_assign)} | Columns: {len(df_assign.columns)}")
     print(f"  WOW1: {(df_assign['source']=='WOW1').sum()} | WOW2: {(df_assign['source']=='WOW2').sum()}")
     print("="*60)
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Cell 14 — manual re-write to same sheet, kept as-is
-    # ──────────────────────────────────────────────────────────────────────
-    sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
-    ws = sheet.worksheet("Student-Assign-WOW")
-    ws.clear()
-    set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
-
-
-    # ──────────────────────────────────────────────────────────────────────
-    # Cell 15 — second sheet target
-    # ──────────────────────────────────────────────────────────────────────
-    sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
-    ws = sheet.worksheet("Student-Assign-WOW")
-    ws.clear()
-    set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
 
 except Exception as e:
     print(f"❌ Pipeline failed: {e}")
