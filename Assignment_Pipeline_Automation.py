@@ -244,7 +244,7 @@ try:
     # STEP 5: Write to Google Sheets
     # ═══════════════════════════════════════════════════════════════════════════
     print("Uploading...")
-    sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
+    sheet = gc.open_by_key('1knzRvmPqhvSudEJeXksQeXSZklAybIBfd_IMH7XLMK4')
     ws = sheet.worksheet("Student-Assign-WOW")
     ws.clear()
     set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
