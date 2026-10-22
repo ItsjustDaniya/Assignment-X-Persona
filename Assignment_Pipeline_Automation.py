@@ -62,10 +62,12 @@ METABASE_DB_ID = 4
 # faster requests (more of them). 89 courses / 8 ≈ 12 requests.
 BATCH_CHUNK_SIZE = 8
 
-# Must match the LU-side course_structure_id list inside card 11345.
-CARD_11345_STRUCTURE_IDS = (
-    "11,14,20,26,50,51,52,53,54,55,56,57,58,59,60,191,269,270,320,321,329,373"
-)
+# Saved Metabase question returning one column `title` = every LU batch that
+# card 11345 covers. Its SQL must use the same course_structure_id list as
+# card 11345. SET THIS to the new card's ID.
+BATCH_LIST_CARD_ID = int(os.getenv("BATCH_LIST_CARD_ID", "13532"))
+if not BATCH_LIST_CARD_ID:
+    raise ValueError("❌ Set BATCH_LIST_CARD_ID (env var or in the script) to the batch-list card's ID")
 
 # -------------------- RETRY-HARDENED SESSION --------------------
 # Transport-level retries cover connection failures and 429/5xx status codes
@@ -172,28 +174,15 @@ def fetch_card(card_id, batch_titles=None, max_retries=4, retry_backoff=60):
 
 def list_2026_batches():
     """LU course titles that have 2026 assignments and fall under card 11345's
-    structure-id list. Used to split card 11345 into small requests."""
-    sql = f"""
-        SELECT DISTINCT cc.title
-        FROM courses_course cc
-        JOIN assignments_assignment aa
-          ON aa.course_id = cc.id
-         AND aa.original_assignment_type = 1
-         AND aa.start_timestamp >= '2026-01-01'
-        WHERE cc.course_structure_id IN ({CARD_11345_STRUCTURE_IDS})
-        ORDER BY cc.title
-    """
-    r = SESSION.post(
-        f"{METABASE_BASE}/api/dataset",
-        headers=METABASE_HEADERS,
-        json={"database": METABASE_DB_ID, "type": "native", "native": {"query": sql}},
-        timeout=300,
-    )
-    r.raise_for_status()
-    body = r.json()
-    if body.get("error"):
-        raise RuntimeError(f"Batch-list query failed: {body['error']}")
-    return [row[0] for row in body["data"]["rows"]]
+    structure-id list. Read from a small saved question (the API key can run
+    saved cards but not ad-hoc SQL via /api/dataset)."""
+    d = fetch_card(BATCH_LIST_CARD_ID, max_retries=3, retry_backoff=15)
+    if 'title' not in d.columns:
+        raise RuntimeError(f"Card {BATCH_LIST_CARD_ID} must return a 'title' column; got {list(d.columns)}")
+    titles = sorted(d['title'].dropna().astype(str).unique().tolist())
+    if not titles:
+        raise RuntimeError(f"Card {BATCH_LIST_CARD_ID} returned no batch titles")
+    return titles
 
 
 def fetch_card_chunked(card_id, titles, chunk_size):
