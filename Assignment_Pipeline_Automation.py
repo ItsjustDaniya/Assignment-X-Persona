@@ -5,12 +5,14 @@ Auto-generated cron pipeline — WOW assignment tracking
 
 Ported from the DS_batches_data notebook, wrapped for unattended GitHub
 Actions execution:
-  - Auth via a Metabase API key (X-Api-Key header) instead of the old
-    username/password session-login flow — no more ASHRITHA_SECRET_KEY,
-    no login POST, no token refresh step.
-  - requests.post is patched to use a retry-hardened Session (connection
-    resets / 5xx / 429 are retried automatically), matching the fix applied
-    to the main Assignment Automation Pipeline for card 9913-style failures.
+  - Auth via a Metabase API key (X-Api-Key header).
+  - Card 11345 is fetched in CHUNKS of batches (via its {{Batch}} filter)
+    instead of one giant request. One request over all ~89 courses ran long
+    enough that the connection was dropped mid-query
+    ("RemoteDisconnected: Remote end closed connection without response").
+  - Transport-level retries no longer re-fire the heavy POST on a dropped
+    connection (read=0). fetch_card's own loop now catches ConnectionError /
+    Timeout too, and waits longer between attempts so Metabase can recover.
   - Any uncaught exception exits non-zero so the GitHub Actions run goes red.
 """
 
@@ -28,11 +30,6 @@ from urllib3.util.retry import Retry
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 
-# Force line-buffered stdout so print() output interleaves in the same
-# chronological order as stderr tracebacks in GitHub Actions logs. Without
-# this, stdout is block-buffered when not attached to a terminal, which is
-# why the ENV CHECK / "Fetching both cards..." prints appeared to run
-# *after* the traceback in the log even though they clearly ran first.
 sys.stdout.reconfigure(line_buffering=True)
 
 start_time = time.time()
@@ -59,18 +56,30 @@ creds = Credentials.from_service_account_info(
 gc = gspread.authorize(creds)
 
 METABASE_BASE = "https://metabase-lierhfgoeiwhr.newtonschool.co"
+METABASE_DB_ID = 4
+
+# How many LU batches to send to card 11345 per request. Lower = smaller,
+# faster requests (more of them). 89 courses / 8 ≈ 12 requests.
+BATCH_CHUNK_SIZE = 8
+
+# Must match the LU-side course_structure_id list inside card 11345.
+CARD_11345_STRUCTURE_IDS = (
+    "11,14,20,26,50,51,52,53,54,55,56,57,58,59,60,191,269,270,320,321,329,373"
+)
 
 # -------------------- RETRY-HARDENED SESSION --------------------
-# Same fix as the main Assignment Automation Pipeline: ConnectionError /
-# ECONNRESET, 429, and 5xx are retried at the transport level instead of
-# failing the whole job on the first hiccup.
+# Transport-level retries cover connection failures and 429/5xx status codes
+# only. read=0: if the server drops the connection mid-query we do NOT
+# immediately re-fire the same heavy query (that just piles load on
+# Metabase). fetch_card's own loop handles that case with a longer wait.
 SESSION = requests.Session()
 _adapter = HTTPAdapter(
     max_retries=Retry(
         total=4,
         connect=4,
-        read=2,
-        backoff_factor=5,             # 5s, 10s, 20s, 40s
+        read=0,
+        status=3,
+        backoff_factor=5,             # 5s, 10s, 20s
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=frozenset(["POST", "GET"]),
         raise_on_status=False,
@@ -81,37 +90,137 @@ _adapter = HTTPAdapter(
 )
 SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
-
-# Every requests.post(...) call in the ported notebook code below now goes
-# through the retry-hardened session automatically — no need to edit each
-# call site individually.
 requests.post = SESSION.post
 
-# Static header used for every Metabase API call — no login step, no
-# token expiry/refresh to worry about.
 METABASE_HEADERS = {
     "Content-Type": "application/json",
     "X-Api-Key": METABASE_API_KEY,
 }
+# Export endpoints take parameters form-encoded, so no JSON content type here.
+METABASE_FORM_HEADERS = {"X-Api-Key": METABASE_API_KEY}
 
 print("🔎 ENV CHECK")
 print(f"   Metabase API key   : {'[SET]' if METABASE_API_KEY else '[MISSING]'}")
 print(f"   SA client_email    : {service_info.get('client_email')}")
 
+
 # ═══════════════════════════════════════════════════════════════════════════
-# PIPELINE BODY (ported from notebook cells: 13,14,15)
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+def fetch_card(card_id, batch_titles=None, max_retries=4, retry_backoff=60):
+    """Fetch a card's rows as a DataFrame.
+
+    batch_titles: optional list of courses_course.title values passed to the
+    card's {{Batch}} field filter, so the query only runs for those batches.
+
+    Retries on: HTTP errors, 200-with-bad-JSON, and dropped connections /
+    timeouts (the failure mode seen on card 11345)."""
+    url = f'{METABASE_BASE}/api/card/{card_id}/query/json'
+    form = None
+    if batch_titles:
+        form = {"parameters": json.dumps([{
+            "type": "string/=",
+            "target": ["dimension", ["template-tag", "Batch"]],
+            "value": list(batch_titles),
+        }])}
+
+    label = f"card {card_id}" + (f" [{len(batch_titles)} batches]" if batch_titles else "")
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        print(f"  → Fetching {label}" +
+              (f" (attempt {attempt}/{max_retries})" if attempt > 1 else "") + "...")
+        attempt_start = time.time()
+        try:
+            if form:
+                r = SESSION.post(url, headers=METABASE_FORM_HEADERS, data=form, timeout=1800)
+            else:
+                r = SESSION.post(url, headers=METABASE_HEADERS, timeout=1800)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            elapsed = time.time() - attempt_start
+            last_error = (f"Connection dropped/timed out after {elapsed:.1f}s: "
+                          f"{type(e).__name__}: {e}")
+            r = None
+
+        if r is not None:
+            elapsed = time.time() - attempt_start
+            if not r.ok:
+                try:
+                    detail = r.json()
+                except ValueError:
+                    detail = r.text
+                last_error = f"HTTP {r.status_code} after {elapsed:.1f}s\nResponse body: {detail}"
+            else:
+                try:
+                    payload = r.json()
+                except ValueError:
+                    last_error = (f"HTTP {r.status_code} after {elapsed:.1f}s but body was not "
+                                  f"valid JSON (length {len(r.text)}): {r.text[:300]!r}")
+                else:
+                    d = pd.DataFrame(payload)
+                    print(f"  ✓ {label}: {len(d)} rows (took {elapsed:.1f}s)")
+                    return d
+
+        if attempt < max_retries:
+            print(f"  ⚠️  {label} attempt {attempt} failed: {last_error}\n"
+                  f"     Retrying in {retry_backoff}s...")
+            time.sleep(retry_backoff)
+            retry_backoff = min(retry_backoff * 2, 300)
+
+    raise RuntimeError(f"❌ {label} failed after {max_retries} attempts. Last error:\n{last_error}")
+
+
+def list_2026_batches():
+    """LU course titles that have 2026 assignments and fall under card 11345's
+    structure-id list. Used to split card 11345 into small requests."""
+    sql = f"""
+        SELECT DISTINCT cc.title
+        FROM courses_course cc
+        JOIN assignments_assignment aa
+          ON aa.course_id = cc.id
+         AND aa.original_assignment_type = 1
+         AND aa.start_timestamp >= '2026-01-01'
+        WHERE cc.course_structure_id IN ({CARD_11345_STRUCTURE_IDS})
+        ORDER BY cc.title
+    """
+    r = SESSION.post(
+        f"{METABASE_BASE}/api/dataset",
+        headers=METABASE_HEADERS,
+        json={"database": METABASE_DB_ID, "type": "native", "native": {"query": sql}},
+        timeout=300,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if body.get("error"):
+        raise RuntimeError(f"Batch-list query failed: {body['error']}")
+    return [row[0] for row in body["data"]["rows"]]
+
+
+def fetch_card_chunked(card_id, titles, chunk_size):
+    frames = []
+    chunks = [titles[i:i + chunk_size] for i in range(0, len(titles), chunk_size)]
+    for n, chunk in enumerate(chunks, 1):
+        print(f" Chunk {n}/{len(chunks)}")
+        d = fetch_card(card_id, batch_titles=chunk)
+        # Guard: if Metabase ignored the parameter we'd silently get every
+        # batch once per chunk (duplicates). Fail loudly instead.
+        if len(d) and 'batch_name' in d.columns:
+            stray = set(d['batch_name'].dropna()) - set(chunk)
+            if stray:
+                raise RuntimeError(
+                    f"Batch filter was ignored by card {card_id} — got rows for "
+                    f"{list(stray)[:3]}... Check the card's Batch filter / parameter format.")
+        frames.append(d)
+        time.sleep(3)  # small gap so we don't hammer Metabase
+    frames = [f for f in frames if len(f)]
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PIPELINE BODY
 # ═══════════════════════════════════════════════════════════════════════════
 try:
-    # ──────────────────────────────────────────────────────────────────────
-    # Cell 13
-    # ──────────────────────────────────────────────────────────────────────
-    import pandas as pd
-    import requests
-    from gspread_dataframe import set_with_dataframe
-
-    # ═══════════════════════════════════════════════════════════════════════════
     # STEP 1: Groomers filter
-    # ═══════════════════════════════════════════════════════════════════════════
     workbook = gc.open('Groomers')
     data1 = workbook.worksheet('Groomers').get_all_values()
     df = pd.DataFrame(data1)
@@ -127,104 +236,36 @@ try:
     filtered_df['user_id'] = filtered_df['user_id'].astype(str).str.strip()
     allowed_ids = filtered_df['user_id'].tolist()
 
-    # ═══════════════════════════════════════════════════════════════════════════
-    # STEP 2: Fetch BOTH Metabase cards and union them
-    # ═══════════════════════════════════════════════════════════════════════════
-    def fetch_card(card_id, max_retries=4, retry_backoff=15):
-        """Fetch a card's data, with retries for two failure modes that have
-        both been seen on card 11345 across different runs: a clean HTTP
-        error (400/5xx), and a 200 status with an empty/non-JSON body (the
-        query ran but the response got truncated somewhere upstream). Both
-        point to an intermittently overloaded/flaky backend rather than a
-        fixed bug in the request itself, so retrying with backoff is
-        actually worth doing here."""
-        url = f'{METABASE_BASE}/api/card/{card_id}/query/json'
-        last_error = None
+    # STEP 2: Fetch both cards and union them
+    print("Listing 2026 batches for card 11345...")
+    titles = list_2026_batches()
+    print(f"✓ {len(titles)} batches → chunks of {BATCH_CHUNK_SIZE}")
 
-        for attempt in range(1, max_retries + 1):
-            print(f"  → Fetching card {card_id}" +
-                  (f" (attempt {attempt}/{max_retries})" if attempt > 1 else "") + "...")
-            attempt_start = time.time()
-            r = requests.post(url, headers=METABASE_HEADERS, timeout=3600)
-            elapsed = time.time() - attempt_start
+    print("Fetching card 11345 (chunked)...")
+    df1 = fetch_card_chunked(11345, titles, BATCH_CHUNK_SIZE)   # Assignments WOW
+    print(f"✓ Card 11345 total: {len(df1)} rows")
 
-            if not r.ok:
-                # r.raise_for_status() throws away Metabase's actual error body,
-                # which almost always explains *why* (e.g. a missing required
-                # template parameter, or the question itself was edited into a
-                # broken state) instead of just the generic status code.
-                try:
-                    detail = r.json()
-                except ValueError:
-                    detail = r.text
-                last_error = (
-                    f"HTTP {r.status_code} after {elapsed:.1f}s (URL: {r.url})\n"
-                    f"Response body: {detail}"
-                )
-            else:
-                try:
-                    payload = r.json()
-                except ValueError:
-                    last_error = (
-                        f"HTTP {r.status_code} after {elapsed:.1f}s but body was not "
-                        f"valid JSON (body length {len(r.text)}, URL: {r.url})\n"
-                        f"Response body (first 300 chars): {r.text[:300]!r}"
-                    )
-                else:
-                    d = pd.DataFrame(payload)
-                    print(f"  ✓ Card {card_id}: {len(d)} rows, {len(d.columns)} cols "
-                          f"(took {elapsed:.1f}s)")
-                    return d
+    print("Fetching card 11773...")
+    df2 = fetch_card(11773)                                     # Assignments WOW 2
 
-            if attempt < max_retries:
-                print(f"  ⚠️  Card {card_id} attempt {attempt} failed: {last_error}\n"
-                      f"     Retrying in {retry_backoff}s...")
-                time.sleep(retry_backoff)
-                retry_backoff = min(retry_backoff * 2, 120)
-
-        raise RuntimeError(
-            f"❌ Card {card_id} failed after {max_retries} attempts. Last error:\n"
-            f"{last_error}\n"
-            "If this keeps happening: open the question directly in Metabase "
-            "(not inside a dashboard) and confirm it runs cleanly there. A "
-            "clean 400 usually means a required template parameter with no "
-            "default value; a 200-with-empty-body usually means the query is "
-            "slow/heavy enough that something upstream is truncating the "
-            "response — consider adding a result cache to it in Metabase."
-        )
-
-    print("Fetching both cards...")
-    df1 = fetch_card(11345)          # Assignments WOW
-    df2 = fetch_card(11773)          # Assignments WOW 2
-
-    # tag source so you can tell the halves apart downstream
     df1['source'] = 'WOW1'
     df2['source'] = 'WOW2'
 
-    # guard: columns must match for a clean union
     only1 = set(df1.columns) - set(df2.columns)
     only2 = set(df2.columns) - set(df1.columns)
     if only1 or only2:
         print(f"  ⚠️ Column mismatch — only in WOW1: {only1} | only in WOW2: {only2}")
 
-    # union (outer concat keeps any non-overlapping cols as NaN rather than erroring)
     df_assignment = pd.concat([df1, df2], ignore_index=True, sort=False)
     print(f"✓ Unioned: {len(df_assignment)} rows")
 
-    # ═══════════════════════════════════════════════════════════════════════════
     # STEP 3: Filter — 2026 batches, approved students
-    # ═══════════════════════════════════════════════════════════════════════════
     df_assignment['user_id'] = df_assignment['user_id'].astype(str).str.strip()
     df_assignment = df_assignment[df_assignment['admin_unit_name'].str.contains('2026', na=False)]
     df_assignment = df_assignment[df_assignment['user_id'].isin(allowed_ids)]
     print(f"✓ Filtered to {len(df_assignment)} rows")
 
-    # NOTE: forward-fill (old Step 3) removed — the SQL now computes cumulatives
-    # on the complete grid via activity-week bucketing, so forward-fill would double-count.
-
-    # ═══════════════════════════════════════════════════════════════════════════
     # STEP 4: Merge with Master Data
-    # ═══════════════════════════════════════════════════════════════════════════
     print("Merging with Master Data...")
     data1 = gc.open('DS Full program - All Intake 2026').worksheet('Master Data 2023-2026').get_all_values()
     dfm = pd.DataFrame(data1)
@@ -235,25 +276,22 @@ try:
     dfm = dfm[dfm['Batch'].str.contains('2025|2026', na=False)]
     dfm['user_id'] = dfm['user_id'].astype(str).str.strip()
 
-    # suffixes avoid Batch / other column collisions with df_assignment
     df_assign = pd.merge(df_assignment, dfm, on='user_id', how='left', suffixes=('', '_master'))
     df_assign = df_assign.drop(columns=[c for c in df_assign.columns if c.endswith('_master')], errors='ignore')
     print(f"✓ Merged: {len(df_assign)} rows")
 
-    # ═══════════════════════════════════════════════════════════════════════════
     # STEP 5: Write to Google Sheets
-    # ═══════════════════════════════════════════════════════════════════════════
     print("Uploading...")
     sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
     ws = sheet.worksheet("Student-Assign-WOW")
     ws.clear()
     set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("✅ UPLOAD SUCCESSFUL")
     print(f"Rows: {len(df_assign)} | Columns: {len(df_assign.columns)}")
     print(f"  WOW1: {(df_assign['source']=='WOW1').sum()} | WOW2: {(df_assign['source']=='WOW2').sum()}")
-    print("="*60)
+    print("=" * 60)
 
 except Exception as e:
     print(f"❌ Pipeline failed: {e}")
