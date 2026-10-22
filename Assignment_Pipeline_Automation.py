@@ -65,6 +65,8 @@ BATCH_CHUNK_SIZE = 8
 # Saved Metabase question returning one column `title` = every LU batch that
 # card 11345 covers. Its SQL must use the same course_structure_id list as
 # card 11345. SET THIS to the new card's ID.
+# Template-tag id of card 11345's {{Batch}} filter (from the card definition).
+BATCH_PARAM_ID = "74b13c96-585e-4f58-9d14-62556e31d95e"
 BATCH_LIST_CARD_ID = int(os.getenv("BATCH_LIST_CARD_ID", "13532"))
 if not BATCH_LIST_CARD_ID:
     raise ValueError("❌ Set BATCH_LIST_CARD_ID (env var or in the script) to the batch-list card's ID")
@@ -121,6 +123,7 @@ def fetch_card(card_id, batch_titles=None, max_retries=4, retry_backoff=60):
     form = None
     if batch_titles:
         form = {"parameters": json.dumps([{
+            "id": BATCH_PARAM_ID,
             "type": "string/=",
             "target": ["dimension", ["template-tag", "Batch"]],
             "value": list(batch_titles),
@@ -152,6 +155,10 @@ def fetch_card(card_id, batch_titles=None, max_retries=4, retry_backoff=60):
                 except ValueError:
                     detail = r.text
                 last_error = f"HTTP {r.status_code} after {elapsed:.1f}s\nResponse body: {detail}"
+                # 4xx (other than 429) is a bad request, not a flaky backend —
+                # retrying won't help, so fail fast.
+                if 400 <= r.status_code < 500 and r.status_code != 429:
+                    raise RuntimeError(f"❌ {label} rejected (not retrying): {last_error}")
             else:
                 try:
                     payload = r.json()
