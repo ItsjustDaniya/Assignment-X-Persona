@@ -21,13 +21,17 @@ import sys
 import json
 import time
 import traceback
+import random
+import math
+from datetime import date, datetime
 
 import requests
 import pandas as pd
 import gspread
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from gspread_dataframe import set_with_dataframe
+from gspread.exceptions import APIError
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -212,6 +216,83 @@ def fetch_card_chunked(card_id, titles, chunk_size):
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
 
+def sheets_retry(fn, attempts=7):
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except (APIError, requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout) as exc:
+            if isinstance(exc, APIError) and exc.response.status_code not in (429, 500, 502, 503, 504):
+                raise
+            if attempt == attempts - 1:
+                raise
+            wait = min(120, 5 * 2 ** attempt) + random.uniform(0, 2)
+            print(f"  Sheets request failed: {exc}; retrying in {wait:.1f}s")
+            time.sleep(wait)
+
+
+def sheet_value(value):
+    if pd.isna(value):
+        return ""
+    if hasattr(value, "item"):
+        value = value.item()
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def upload_dataframe_chunked(sheet, ws, df, chunk_size=2000):
+    rows, cols = len(df) + 1, len(df.columns)
+    if not cols or not len(df):
+        raise RuntimeError("Refusing to overwrite output with an empty dataset")
+    metadata = sheets_retry(lambda: sheet.fetch_sheet_metadata(params={
+        "fields": "sheets(properties(sheetId,title,gridProperties(rowCount,columnCount)))"
+    }))
+    grids = [x["properties"] for x in metadata["sheets"]]
+    target = next(x for x in grids if x["sheetId"] == ws.id)
+    old_rows = target["gridProperties"]["rowCount"]
+    old_cols = target["gridProperties"]["columnCount"]
+    new_rows, new_cols = max(rows, old_rows), max(cols, old_cols)
+    other_cells = sum(x.get("gridProperties", {}).get("rowCount", 0) *
+                      x.get("gridProperties", {}).get("columnCount", 0)
+                      for x in grids if x["sheetId"] != ws.id)
+    projected = other_cells + new_rows * new_cols
+    print(f"Output: {rows:,} rows x {cols} columns; projected workbook grid: {projected:,} cells")
+    if projected > 10_000_000:
+        raise RuntimeError("Projected workbook exceeds 10 million cells. Reduce unused grid rows/columns or split the output before retrying.")
+    if (new_rows, new_cols) != (old_rows, old_cols):
+        sheets_retry(lambda: ws.resize(rows=new_rows, cols=new_cols))
+    def write(first, values):
+        last = first + len(values) - 1
+        rng = f"A{first}:{rowcol_to_a1(last, cols)}"
+        # Split by payload size as well as row count.
+        if len(values) > 1 and len(json.dumps(values, ensure_ascii=False).encode("utf-8")) > 1_500_000:
+            mid = len(values) // 2
+            write(first, values[:mid])
+            write(first + mid, values[mid:])
+            return
+        sheets_retry(lambda: ws.update(range_name=rng, values=values, value_input_option="USER_ENTERED"))
+        time.sleep(2)
+    write(1, [df.columns.astype(str).tolist()])
+    total = math.ceil(len(df) / chunk_size)
+    for n, start in enumerate(range(0, len(df), chunk_size), 1):
+        values = [[sheet_value(v) for v in row] for row in df.iloc[start:start + chunk_size].itertuples(index=False, name=None)]
+        write(start + 2, values)
+        print(f"  Upload chunk {n}/{total}: {len(values):,} rows")
+    stale = []
+    if old_rows > rows:
+        stale.append(f"A{rows + 1}:{rowcol_to_a1(old_rows, old_cols)}")
+    if old_cols > cols:
+        stale.append(f"{rowcol_to_a1(1, cols + 1)}:{rowcol_to_a1(min(rows, old_rows), old_cols)}")
+    if stale:
+        sheets_retry(lambda: ws.batch_clear(stale))
+    print("  Upload and stale-data cleanup complete")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PIPELINE BODY
 # ═══════════════════════════════════════════════════════════════════════════
@@ -272,16 +353,20 @@ try:
     dfm = dfm[dfm['Batch'].str.contains('2025|2026', na=False)]
     dfm['user_id'] = dfm['user_id'].astype(str).str.strip()
 
+    duplicate_keys = dfm.loc[dfm['user_id'].duplicated(keep=False), 'user_id'].nunique()
+    if duplicate_keys:
+        print(f"WARNING: {duplicate_keys} duplicate user IDs in Master Data; preserving existing merge logic.")
     df_assign = pd.merge(df_assignment, dfm, on='user_id', how='left', suffixes=('', '_master'))
     df_assign = df_assign.drop(columns=[c for c in df_assign.columns if c.endswith('_master')], errors='ignore')
     print(f"✓ Merged: {len(df_assign)} rows")
+    if len(df_assign) > len(df_assignment):
+        print(f"WARNING: merge added {len(df_assign)-len(df_assignment):,} rows; verify Master Data join grain.")
 
     # STEP 5: Write to Google Sheets
     print("Uploading...")
     sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
     ws = sheet.worksheet("Student-Assign-WOW")
-    ws.clear()
-    set_with_dataframe(ws, df_assign, include_index=False, include_column_header=True)
+    upload_dataframe_chunked(sheet, ws, df_assign)
 
     print("\n" + "=" * 60)
     print("✅ UPLOAD SUCCESSFUL")
