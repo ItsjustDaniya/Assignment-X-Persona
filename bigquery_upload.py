@@ -1,5 +1,7 @@
 """Publish a validated full snapshot; never modify the legacy dataframe."""
-import os, json, re, uuid
+import os, json, re
+from datetime import datetime, timezone, timedelta
+from google.api_core.exceptions import NotFound
 import pandas as pd
 from google.cloud import bigquery
 from google.oauth2.service_account import Credentials
@@ -17,7 +19,6 @@ def upload_to_bigquery(df):
     dataset = os.getenv('BQ_DATASET', 'academic_analytics')
     location = os.getenv('BQ_LOCATION', 'asia-south1')
     table = f'{project}.{dataset}.assignment_wow'
-    staging = table + '_stage_' + uuid.uuid4().hex
     creds = Credentials.from_service_account_info(json.loads(os.environ['SERVICE_ACCOUNT_JSON']), scopes=['https://www.googleapis.com/auth/cloud-platform'])
     client = bigquery.Client(project=project, credentials=creds, location=location)
     out = pd.DataFrame(index=df.index)
@@ -37,17 +38,25 @@ def upload_to_bigquery(df):
             out[name] = s.astype('string'); kind = 'STRING'
         schema.append(bigquery.SchemaField(name, kind, description=str(original)))
     try:
-        config = bigquery.LoadJobConfig(schema=schema, write_disposition='WRITE_TRUNCATE')
-        client.load_table_from_dataframe(out, staging, job_config=config, location=location).result()
-        if client.get_table(staging).num_rows != len(out): raise RuntimeError('Staging row count mismatch')
-        from google.api_core.exceptions import NotFound
-        try:
-            existing = client.get_table(table)
-        except NotFound:
-            existing = None
-        if existing is not None and [(f.name,f.field_type) for f in existing.schema] != [(f.name,f.field_type) for f in client.get_table(staging).schema]:
-            raise RuntimeError('Schema drift detected; production table unchanged')
-        client.copy_table(staging, table, job_config=bigquery.CopyJobConfig(write_disposition='WRITE_TRUNCATE'), location=location).result()
-        print(f'BigQuery published {len(out):,} rows to {table}')
-    finally:
-        client.delete_table(staging, not_found_ok=True)
+        existing = client.get_table(table)
+    except NotFound:
+        existing = None
+    expected = [(f.name, f.field_type) for f in schema]
+    if existing is not None:
+        actual = [(f.name, f.field_type) for f in existing.schema]
+        if actual != expected:
+            raise RuntimeError('Schema drift detected; destination unchanged')
+    config = bigquery.LoadJobConfig(
+        schema=schema,
+        write_disposition='WRITE_TRUNCATE',
+        create_disposition='CREATE_IF_NEEDED',
+    )
+    job = client.load_table_from_dataframe(out, table, job_config=config, location=location)
+    job.result()
+    published = client.get_table(table)
+    if published.num_rows != len(out):
+        raise RuntimeError('Published row count mismatch')
+    print(f'BigQuery published {len(out):,} rows to {table}')
+    print(f'Table expiration: {published.expires}')
+    if published.expires and published.expires - datetime.now(timezone.utc) < timedelta(days=7):
+        print('WARNING: table expires within 7 days; next successful load can recreate it.')
