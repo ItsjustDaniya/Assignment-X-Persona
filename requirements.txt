@@ -1,7 +1,7 @@
-gspread
-gspread-dataframe
-google-auth
-google-auth-oauthlib
-pandas
-numpy
 requests
+pandas
+gspread
+google-auth
+google-cloud-bigquery
+pyarrow
+db-dtypes
