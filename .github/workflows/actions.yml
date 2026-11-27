@@ -1,48 +1,31 @@
-name: Run Assignment Pipeline Automation
-
+name: Assignment Automation - Parallel BigQuery
 on:
-  schedule:
-   - cron: '30 4 * * *'    # 10:00 AM IST (4:30 UTC)
   workflow_dispatch:
-
+  # Enable schedule only after manual validation; replace old workflow, do not duplicate it.
+  # schedule:
+  #   - cron: '30 3,6,9,12,15,18 * * *'
+permissions:
+  contents: read
 concurrency:
-  group: assignment-pipeline-automation
+  group: assignment-automation-pipeline
   cancel-in-progress: false
-
 jobs:
-  run-assignment-pipeline:
+  refresh:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 180
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Python 3.12
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Execute Assignment_Pipeline_Automation.py
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python Assignment_Pipeline_Automation.py
         env:
           METABASE_API_KEY: ${{ secrets.METABASE_API_KEY }}
           SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
-          METABASE_URL: ${{ secrets.METABASE_URL }}
-
-        run: |
-          echo "=============================="
-          echo "Workflow triggered at UTC: $(date -u)"
-          echo "Current branch: $GITHUB_REF"
-          echo "Repository path: $GITHUB_WORKSPACE"
-          echo "=============================="
-          echo "🚀 Starting Assignment_Pipeline_Automation.py..."
-          echo "Using Metabase URL: ${METABASE_URL:0:25}****"
-          echo "Using USERNAME variable: ${USERNAME:+[SET]}"
-
-          python Assignment_Pipeline_Automation.py
-
-          echo "✅ Assignment_Pipeline_Automation.py executed successfully."
+          BQ_PROJECT_ID: masterclass-automation-503806
+          BQ_DATASET: academic_analytics
+          BQ_LOCATION: asia-south1
+          ENABLE_BIGQUERY: 'true'
+          ENABLE_SHEETS: 'true'
+          PYTHONUNBUFFERED: '1'
