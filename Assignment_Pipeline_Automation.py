@@ -256,7 +256,7 @@ def upload_dataframe_chunked(sheet, ws, df, chunk_size=2000):
     target = next(x for x in grids if x["sheetId"] == ws.id)
     old_rows = target["gridProperties"]["rowCount"]
     old_cols = target["gridProperties"]["columnCount"]
-    new_rows, new_cols = max(rows, old_rows), max(cols, old_cols)
+    new_rows, new_cols = rows, cols
     other_cells = sum(x.get("gridProperties", {}).get("rowCount", 0) *
                       x.get("gridProperties", {}).get("columnCount", 0)
                       for x in grids if x["sheetId"] != ws.id)
@@ -283,14 +283,7 @@ def upload_dataframe_chunked(sheet, ws, df, chunk_size=2000):
         values = [[sheet_value(v) for v in row] for row in df.iloc[start:start + chunk_size].itertuples(index=False, name=None)]
         write(start + 2, values)
         print(f"  Upload chunk {n}/{total}: {len(values):,} rows")
-    stale = []
-    if old_rows > rows:
-        stale.append(f"A{rows + 1}:{rowcol_to_a1(old_rows, old_cols)}")
-    if old_cols > cols:
-        stale.append(f"{rowcol_to_a1(1, cols + 1)}:{rowcol_to_a1(min(rows, old_rows), old_cols)}")
-    if stale:
-        sheets_retry(lambda: ws.batch_clear(stale))
-    print("  Upload and stale-data cleanup complete")
+    print("  Upload complete; output grid resized to exact dimensions")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -362,11 +355,32 @@ try:
     if len(df_assign) > len(df_assignment):
         print(f"WARNING: merge added {len(df_assign)-len(df_assignment):,} rows; verify Master Data join grain.")
 
+    bq_error = None
+    if os.getenv("ENABLE_BIGQUERY", "false").lower() == "true":
+        try:
+            from bigquery_upload import upload_to_bigquery
+            upload_to_bigquery(df_assign)
+        except Exception as exc:
+            bq_error = exc
+            print("BigQuery failed; continuing legacy output")
+            traceback.print_exc()
+
+    # Remove only the six approved fields, matching trimmed headers.
+    drop_fields = {"Current company", "Current Job role", "Siddhi/ Mohit approval",
+                   "Paridhi/KC", "Retention Remarks", "Reason for cancellation"}
+    remove = [c for c in df_assign.columns if str(c).strip() in drop_fields]
+    df_assign = df_assign.drop(columns=remove)
+    print(f"Removed columns: {remove}; output: {len(df_assign):,} rows x {len(df_assign.columns)} columns")
+
     # STEP 5: Write to Google Sheets
-    print("Uploading...")
-    sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
-    ws = sheet.worksheet("Student-Assign-WOW")
-    upload_dataframe_chunked(sheet, ws, df_assign)
+    if os.getenv("ENABLE_SHEETS", "true").lower() == "true":
+        print("Uploading...")
+        sheet = gc.open_by_key('1-ZiZ5gyYKWK49GuFqqIDNobIr60Gek7DLsmfAhHbmTQ')
+        ws = sheet.worksheet("Student-Assign-WOW")
+        upload_dataframe_chunked(sheet, ws, df_assign)
+
+    if bq_error is not None:
+        raise RuntimeError("BigQuery upload failed; legacy output attempted") from bq_error
 
     print("\n" + "=" * 60)
     print("✅ UPLOAD SUCCESSFUL")
